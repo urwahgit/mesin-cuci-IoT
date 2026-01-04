@@ -1,0 +1,401 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+// ================== KONFIG PIN ==================
+#define PIN_AIR        16
+#define PIN_MOTOR_PWR  17
+#define PIN_MOTOR_DIR  18
+#define PIN_DRAIN      19
+#define PIN_FLOAT      32   // NC
+
+#define MOTOR_TRANSITION_MS 50   // ← dari 1000 ms jadi 300 ms, 100 deh, hehehe, biar makin cepet.
+
+
+// ================== WIFI & BOT ==================
+const char* ssid = "NAMA WIFI";
+const char* password = "PASSWORD WIFI";
+#define BOT_TOKEN "ISI BOT TOKEN TELEGRAM KAMU"
+#define CHAT_ID  CHAT ID TELEGRAM, BISA PERSONAL ATAU GRUP"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+// ================== STATE ==================
+enum State { IDLE, SEMI_WASH, PACKAGE, STOPPED };
+State currentState = IDLE;
+
+// ================== MOTOR STATE ==================
+enum MotorPhase {
+  A1_ON,
+  A1_OFF,
+  CHANGE_TO_A2,
+  A2_ON,
+  A2_OFF,
+  CHANGE_TO_A1
+};
+MotorPhase motorPhase = A1_ON;
+
+// ================== TIMER ==================
+unsigned long nowMillis;
+unsigned long stateMillis;
+unsigned long motorMillis;
+unsigned long stepMillis;
+
+// ================== variabel biar pas proses paket pencucian, pada saat mencuci dan membilas air nyala 15 detik, mati 45 detik ======
+unsigned long airMillis = 0;
+bool airOnPhase = false;
+
+
+// ================== VAR ==================
+int requestedMinutes = 0;
+int washMinutes = 0;
+int rinseMinutes = 0;
+
+bool waitingTimeInput = false;
+bool waitingWashTime = false;
+bool waitingRinseTime = false;
+
+int packageStep = 0;
+int cycleCounter = 0;
+
+// ===== TAMBAHAN FLAG =====
+bool airManualMode = false;
+bool airFullNotified = false;
+int lastPackageStep = -1;
+
+// ================== UTIL ==================
+void allOff() {
+  digitalWrite(PIN_AIR, LOW);
+  digitalWrite(PIN_DRAIN, LOW);
+  digitalWrite(PIN_MOTOR_PWR, LOW);
+  digitalWrite(PIN_MOTOR_DIR, LOW);
+}
+
+void sendMsg(String msg) {
+  bot.sendMessage(CHAT_ID, msg, "");
+}
+
+// ================== MOTOR HANDLER (20 DETIK) ==================
+void handleMotorWash() {
+  switch (motorPhase) {
+
+    case A1_ON:
+      digitalWrite(PIN_MOTOR_DIR, LOW);
+      digitalWrite(PIN_MOTOR_PWR, HIGH);
+      if (nowMillis - motorMillis >= 9400) {
+        digitalWrite(PIN_MOTOR_PWR, LOW);
+        motorMillis = nowMillis;
+        motorPhase = A1_OFF;
+      }
+      break;
+
+    case A1_OFF:
+      if (nowMillis - motorMillis >= MOTOR_TRANSITION_MS) {
+        motorMillis = nowMillis;
+        motorPhase = CHANGE_TO_A2;
+      }
+      break;
+
+    case CHANGE_TO_A2:
+      digitalWrite(PIN_MOTOR_DIR, HIGH);
+      if (nowMillis - motorMillis >= MOTOR_TRANSITION_MS) {
+        motorMillis = nowMillis;
+        motorPhase = A2_ON;
+      }
+      break;
+
+    case A2_ON:
+      digitalWrite(PIN_MOTOR_DIR, HIGH);
+      digitalWrite(PIN_MOTOR_PWR, HIGH);
+      if (nowMillis - motorMillis >= 9400) {
+        digitalWrite(PIN_MOTOR_PWR, LOW);
+        motorMillis = nowMillis;
+        motorPhase = A2_OFF;
+      }
+      break;
+
+    case A2_OFF:
+      if (nowMillis - motorMillis >= MOTOR_TRANSITION_MS) {
+        motorMillis = nowMillis;
+        motorPhase = CHANGE_TO_A1;
+      }
+      break;
+
+    case CHANGE_TO_A1:
+      digitalWrite(PIN_MOTOR_DIR, LOW);
+      if (nowMillis - motorMillis >= MOTOR_TRANSITION_MS) {
+        motorMillis = nowMillis;
+        motorPhase = A1_ON;
+        cycleCounter++;   // 1 siklus = 20 detik
+      }
+      break;
+  }
+}
+
+// === fungsi kecil khusus air periodik, biar pas proses paket pencucian, pada saat mencuci dan membilas air nyala 15 detik, mati 45 detik ======
+void handlePeriodicAir() {
+  if (airOnPhase) {
+    digitalWrite(PIN_AIR, HIGH);
+    if (nowMillis - airMillis >= 15000) {   // 15 detik ON
+      digitalWrite(PIN_AIR, LOW);
+      airMillis = nowMillis;
+      airOnPhase = false;
+    }
+  } else {
+    if (nowMillis - airMillis >= 45000) {   // 45 detik OFF
+      airMillis = nowMillis;
+      airOnPhase = true;
+    }
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  pinMode(PIN_AIR, OUTPUT);
+  pinMode(PIN_DRAIN, OUTPUT);
+  pinMode(PIN_MOTOR_PWR, OUTPUT);
+  pinMode(PIN_MOTOR_DIR, OUTPUT);
+  pinMode(PIN_FLOAT, INPUT_PULLUP);
+
+  allOff();
+
+  WiFi.begin(ssid, password);
+  client.setInsecure();
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  sendMsg("🟢 Sistem siap");
+}
+
+// ================== LOOP ==================
+void loop() {
+  nowMillis = millis();
+  handleTelegram();
+
+  if (currentState == SEMI_WASH) {
+    handleMotorWash();
+  }
+  else if (currentState == PACKAGE && (packageStep == 1 || packageStep == 4)) {
+    handleMotorWash();
+    handlePeriodicAir();
+  }
+
+  // ===== MONITOR AIR MANUAL =====
+  if (airManualMode && !airFullNotified && digitalRead(PIN_FLOAT) == HIGH) {
+    digitalWrite(PIN_AIR, LOW);
+    airManualMode = false;
+    airFullNotified = true;
+    sendMsg("💧 Air penuh");
+  }
+
+  handleSemiWash();
+  handlePackage();
+}
+
+// ================== TELEGRAM ==================
+void handleTelegram() {
+
+  int n = bot.getUpdates(bot.last_message_received + 1);
+  while (n) {
+    for (int i = 0; i < n; i++) {
+      
+      nowMillis = millis();            // ✅ PATCH
+      if (currentState == SEMI_WASH ||(currentState == PACKAGE && (packageStep == 1 || packageStep == 4))) {
+        handleMotorWash();             // ✅ PATCH
+      }
+      
+      String text = bot.messages[i].text;
+
+      String chat_id = bot.messages[i].chat_id;
+      if (chat_id != CHAT_ID) continue;
+
+      if (text == "/stop") {
+        allOff();
+        currentState = STOPPED;
+        sendMsg("🚨 EMERGENCY STOP");
+        continue;
+      }
+
+      if (text == "/reset") {
+        allOff();
+        currentState = IDLE;
+        waitingTimeInput = false;
+        waitingWashTime = false;
+        waitingRinseTime = false;
+        sendMsg("🔄 Reset ke IDLE");
+        continue;
+      }
+
+      if (currentState == PACKAGE && !waitingWashTime && !waitingRinseTime) {
+        sendMsg("⛔ Paket cuci sedang berjalan");
+        continue;
+      }
+
+      if (waitingTimeInput) {
+        requestedMinutes = text.toInt();
+        if (requestedMinutes > 0) {
+          stateMillis = nowMillis;
+          motorMillis = nowMillis;
+          cycleCounter = 0;
+          motorPhase = A1_ON;
+          currentState = SEMI_WASH;
+          waitingTimeInput = false;
+          sendMsg("🌀 Semi wash " + String(requestedMinutes) + " menit");
+        }
+        continue;
+      }
+
+      if (waitingWashTime) {
+        washMinutes = text.toInt();
+        if (washMinutes > 0) {
+          waitingWashTime = false;
+          waitingRinseTime = true;
+          sendMsg("⏱ Berapa menit BILAS?");
+        }
+        continue;
+      }
+
+      if (waitingRinseTime) {
+        rinseMinutes = text.toInt();
+        if (rinseMinutes > 0) {
+          waitingRinseTime = false;
+          currentState = PACKAGE;
+          packageStep = 0;
+          cycleCounter = 0;
+          motorMillis = nowMillis;
+          motorPhase = A1_ON;
+          sendMsg("🧺 Paket cuci DIMULAI");
+        }
+        continue;
+      }
+
+      if (text == "/air_on") {
+        digitalWrite(PIN_AIR, HIGH);
+        airManualMode = true;
+        airFullNotified = false;
+        sendMsg("💧 Air ON");
+      }
+      else if (text == "/air_off") {
+        digitalWrite(PIN_AIR, LOW);
+        airManualMode = false;
+        sendMsg("💧 Air OFF");
+      }
+      else if (text == "/drain_on") { digitalWrite(PIN_DRAIN, HIGH); sendMsg("🚰 Drain ON"); }
+      else if (text == "/drain_off") { digitalWrite(PIN_DRAIN, LOW); sendMsg("🚰 Drain OFF"); }
+      else if (text == "/cuci") { waitingTimeInput = true; sendMsg("⏱ Waktu cuci (menit):"); }
+      else if (text == "/paket_cuci") { waitingWashTime = true; sendMsg("⏱ Berapa menit CUCI (dengan sabun)?"); }
+    }
+
+    n = bot.getUpdates(bot.last_message_received + 1);
+  }
+}
+
+// ================== SEMI WASH ==================
+void handleSemiWash() {
+  if (currentState != SEMI_WASH) return;
+  if (nowMillis - stateMillis >= (unsigned long)requestedMinutes * 60000UL) {
+    allOff();
+    currentState = IDLE;
+    sendMsg("✅ Semi wash selesai");
+  }
+}
+
+// ================== PACKAGE ==================
+void handlePackage() {
+  if (currentState != PACKAGE) return;
+
+  if (packageStep != lastPackageStep) {
+    lastPackageStep = packageStep;
+    if (packageStep == 1 || packageStep == 4) {
+      airMillis = nowMillis;
+      airOnPhase = true;
+      digitalWrite(PIN_AIR, HIGH);
+    }
+    if (packageStep == 0) sendMsg("💧 Pengisian air");
+    if (packageStep == 1) sendMsg("🌀 Pencucian dengan sabun");
+    if (packageStep == 2) sendMsg("🚰 Pembuangan air");
+    if (packageStep == 3) sendMsg("💧 Pengisian air bilas");
+    if (packageStep == 4) sendMsg("💦 Pembilasan");
+    if (packageStep == 5) sendMsg("🚰 Pembuangan akhir");
+  }
+
+  switch (packageStep) {
+
+    case 0:
+      digitalWrite(PIN_MOTOR_PWR, LOW);
+      digitalWrite(PIN_AIR, HIGH);
+      if (digitalRead(PIN_FLOAT) == HIGH) {
+        digitalWrite(PIN_AIR, LOW);
+        sendMsg("💧 Air penuh");
+        packageStep++;
+      }
+      break;
+
+    case 1:
+      if (cycleCounter >= washMinutes * 3) {
+        cycleCounter = 0;
+        packageStep++;
+        // panggil fungsi air masuk 15 detik, mati 45 detik selama proses pencucian:
+        handlePeriodicAir();
+      }
+      break;
+
+    case 2:
+      digitalWrite(PIN_AIR, LOW);
+
+      if (stepMillis == 0) stepMillis = nowMillis;   // ✅ PATCH
+
+      if (nowMillis - stepMillis >= (digitalRead(PIN_DRAIN) ? 30000 : 10000)) {
+      digitalWrite(PIN_DRAIN, !digitalRead(PIN_DRAIN));
+      stepMillis = nowMillis;
+      if (!digitalRead(PIN_DRAIN)) cycleCounter++;
+       }
+      if (cycleCounter >= 6) {
+        digitalWrite(PIN_DRAIN, LOW);
+        cycleCounter = 0;
+        stepMillis = 0;                              // ✅ PATCH
+        packageStep++;
+      }
+      break;
+
+
+    case 3:
+      digitalWrite(PIN_MOTOR_PWR, LOW);
+      digitalWrite(PIN_AIR, HIGH);
+      if (digitalRead(PIN_FLOAT) == HIGH) {
+        digitalWrite(PIN_AIR, LOW);
+        sendMsg("💧 Air penuh");
+        packageStep++;
+      }
+      break;
+
+    case 4:
+      if (cycleCounter >= rinseMinutes * 3) {
+        cycleCounter = 0;
+        packageStep++;
+        // panggil fungsi air masuk 15 detik, mati 45 detik selama proses pembilasan:
+        handlePeriodicAir();
+      }
+      break;
+
+    case 5:
+      digitalWrite(PIN_AIR, LOW);
+
+      if (stepMillis == 0) stepMillis = nowMillis;   // ✅ PATCH
+
+      if (nowMillis - stepMillis >= (digitalRead(PIN_DRAIN) ? 30000 : 10000)) {
+        digitalWrite(PIN_DRAIN, !digitalRead(PIN_DRAIN));
+        stepMillis = nowMillis;
+        if (!digitalRead(PIN_DRAIN)) cycleCounter++;
+      }
+      if (cycleCounter >= 10) {
+        stepMillis = 0;                              // ✅ PATCH
+        allOff();
+        currentState = IDLE;
+        sendMsg("🎉 Paket cuci SELESAI");
+      }
+      break;
+
+  }
+}
