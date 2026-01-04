@@ -10,14 +10,14 @@
 #define PIN_DRAIN      19
 #define PIN_FLOAT      32   // NC
 
-#define MOTOR_TRANSITION_MS 50   // ← dari 1000 ms jadi 300 ms, 100 deh, hehehe, biar makin cepet.
+#define MOTOR_TRANSITION_MS 50   // ← Waktu transisi arah putar motor selama 50 mili sekon
 
 
 // ================== WIFI & BOT ==================
 const char* ssid = "NAMA WIFI";
 const char* password = "PASSWORD WIFI";
 #define BOT_TOKEN "ISI BOT TOKEN TELEGRAM KAMU"
-#define CHAT_ID  CHAT ID TELEGRAM, BISA PERSONAL ATAU GRUP"
+#define CHAT_ID  "CHAT ID TELEGRAM, BISA PERSONAL ATAU GRUP"
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
@@ -128,7 +128,7 @@ void handleMotorWash() {
       if (nowMillis - motorMillis >= MOTOR_TRANSITION_MS) {
         motorMillis = nowMillis;
         motorPhase = A1_ON;
-        cycleCounter++;   // 1 siklus = 20 detik
+        cycleCounter++;   // 1 siklus = 20 detik atau 20.000 mili detik
       }
       break;
   }
